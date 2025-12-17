@@ -1,56 +1,86 @@
-payload = await request.json()
+import os
+import time
+import uuid
+from typing import Any, Dict, Optional
 
-# Support BOTH:
-# 1) direct calls (curl) where payload IS the args
-# 2) Vapi tool-calls wrapper where args live inside message.toolCallList[0].arguments
-tool_call_id = None
-args = payload
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-if isinstance(payload, dict) and "message" in payload:
-    msg = payload.get("message") or {}
-    tool_calls = msg.get("toolCallList") or []
-    if tool_calls and isinstance(tool_calls, list):
-        tool_call_id = tool_calls[0].get("id")
-        args = tool_calls[0].get("arguments") or {}
+app = FastAPI(title="21ai Control Plane", version="1.0.0")
 
-# Forward to n8n
-url = f"{N8N_BASE_URL}{path}"
-t0 = time.time()
+# --- CORS (lock down later) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-try:
-    async with httpx.AsyncClient(timeout=25.0) as client:
-        r = await client.post(url, json=args)
-except Exception as e:
-    raise HTTPException(status_code=502, detail=f"n8n request failed: {str(e)}")
+WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "").rstrip("/")  # e.g. https://glistening-truth-production.up.railway.app
+REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "30"))
 
-latency_ms = int((time.time() - t0) * 1000)
-result_data = _safe_json(r)
+# -------------------- Models --------------------
+class StartAgentRequest(BaseModel):
+    agentId: str = Field(..., description="Unique agent template/instance id")
+    roomName: Optional[str] = Field(None, description="If omitted, we generate one")
+    agentConfig: Dict[str, Any] = Field(default_factory=dict)
 
-# If this came from Vapi, respond in Vapi's required format
-if tool_call_id:
-    if r.status_code >= 400:
-        return {
-            "results": [
-                {
-                    "toolCallId": tool_call_id,
-                    "result": {"ok": False, "n8n_status": r.status_code, "n8n_body": result_data}
-                }
-            ]
-        }
-    return {
-        "results": [
-            {
-                "toolCallId": tool_call_id,
-                "result": result_data
-            }
-        ]
+class StopAgentRequest(BaseModel):
+    agentId: str
+    roomName: Optional[str] = None
+
+# -------------------- Routes --------------------
+@app.get("/health")
+async def health():
+    return {"ok": True, "service": "control-plane", "ts": int(time.time())}
+
+@app.post("/agent/start")
+async def agent_start(req: StartAgentRequest):
+    if not WORKER_BASE_URL:
+        raise HTTPException(status_code=500, detail="WORKER_BASE_URL is not set")
+
+    room_name = req.roomName or f"agent_{req.agentId}_{int(time.time() * 1000)}"
+    payload = {
+        "agentId": req.agentId,
+        "roomName": room_name,
+        "agentConfig": req.agentConfig,
+        # Add anything else your worker expects here (livekitUrl, apiKey/secret, etc.)
     }
 
-# Otherwise (curl/manual), keep your existing style
-if r.status_code >= 400:
-    return JSONResponse(
-        status_code=502,
-        content={"ok": False, "tool": tool_name, "tenant": x_tenant_id, "n8n_status": r.status_code, "latency_ms": latency_ms, "n8n_body": result_data},
-    )
+    url = f"{WORKER_BASE_URL}/agent/start"
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
+            r = await client.post(url, json=payload)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail={"worker_error": r.text})
+        return {"ok": True, "roomName": room_name, "worker": r.json() if r.headers.get("content-type","").startswith("application/json") else r.text}
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Worker request failed: {str(e)}")
 
-return {"ok": True, "tool": tool_name, "tenant": x_tenant_id, "latency_ms": latency_ms, "data": result_data}
+@app.post("/agent/stop")
+async def agent_stop(req: StopAgentRequest):
+    if not WORKER_BASE_URL:
+        raise HTTPException(status_code=500, detail="WORKER_BASE_URL is not set")
+
+    payload = {"agentId": req.agentId}
+    if req.roomName:
+        payload["roomName"] = req.roomName
+
+    url = f"{WORKER_BASE_URL}/agent/stop"
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
+            r = await client.post(url, json=payload)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail={"worker_error": r.text})
+        return {"ok": True, "worker": r.json() if r.headers.get("content-type","").startswith("application/json") else r.text}
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Worker request failed: {str(e)}")
+
+# If you *really* need raw request.json(), it must be inside a function like this:
+@app.post("/debug/echo")
+async def echo(request: Request):
+    payload = await request.json()
+    return {"ok": True, "payload": payload}
