@@ -1,86 +1,115 @@
 import os
+import json
 import time
-import uuid
 from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
 
-app = FastAPI(title="21ai Control Plane", version="1.0.0")
+app = FastAPI(title="21ai Tool Gateway", version="1.0.0")
 
-# --- CORS (lock down later) ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "").rstrip("/")  # e.g. https://glistening-truth-production.up.railway.app
-REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "30"))
+def _get_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v
 
-# -------------------- Models --------------------
-class StartAgentRequest(BaseModel):
-    agentId: str = Field(..., description="Unique agent template/instance id")
-    roomName: Optional[str] = Field(None, description="If omitted, we generate one")
-    agentConfig: Dict[str, Any] = Field(default_factory=dict)
 
-class StopAgentRequest(BaseModel):
-    agentId: str
-    roomName: Optional[str] = None
+def _load_tool_map() -> Dict[str, Dict[str, str]]:
+    raw = _get_env("TOOL_MAP_JSON")
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"Invalid TOOL_MAP_JSON: {e}")
 
-# -------------------- Routes --------------------
-@app.get("/health")
-async def health():
-    return {"ok": True, "service": "control-plane", "ts": int(time.time())}
 
-@app.post("/agent/start")
-async def agent_start(req: StartAgentRequest):
-    if not WORKER_BASE_URL:
-        raise HTTPException(status_code=500, detail="WORKER_BASE_URL is not set")
+async def call_n8n(path_or_url: str, payload: Dict[str, Any]) -> Any:
+    """
+    Calls n8n webhook with required auth header.
+    TOOL_MAP_JSON can store either:
+      - full URL: https://.../webhook/xyz
+      - or path: /webhook/xyz
+    """
+    base_url = _get_env("N8N_BASE_URL").rstrip("/")
+    secret = _get_env("N8N_BOOKING_SECRET")
 
-    room_name = req.roomName or f"agent_{req.agentId}_{int(time.time() * 1000)}"
-    payload = {
-        "agentId": req.agentId,
-        "roomName": room_name,
-        "agentConfig": req.agentConfig,
-        # Add anything else your worker expects here (livekitUrl, apiKey/secret, etc.)
+    if path_or_url.startswith("http"):
+        url = path_or_url
+    else:
+        if not path_or_url.startswith("/"):
+            path_or_url = "/" + path_or_url
+        url = base_url + path_or_url
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-21ai-secret": secret,
     }
 
-    url = f"{WORKER_BASE_URL}/agent/start"
+    start = time.time()
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, json=payload, headers=headers)
+    latency_ms = int((time.time() - start) * 1000)
+
+    # n8n often returns json, but keep safe fallback
+    text = r.text
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
-            r = await client.post(url, json=payload)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail={"worker_error": r.text})
-        return {"ok": True, "roomName": room_name, "worker": r.json() if r.headers.get("content-type","").startswith("application/json") else r.text}
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Worker request failed: {str(e)}")
+        data = r.json()
+    except Exception:
+        data = {"raw": text}
 
-@app.post("/agent/stop")
-async def agent_stop(req: StopAgentRequest):
-    if not WORKER_BASE_URL:
-        raise HTTPException(status_code=500, detail="WORKER_BASE_URL is not set")
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=r.status_code,
+            detail={
+                "error": "n8n_request_failed",
+                "status_code": r.status_code,
+                "latency_ms": latency_ms,
+                "response": data,
+            },
+        )
 
-    payload = {"agentId": req.agentId}
-    if req.roomName:
-        payload["roomName"] = req.roomName
+    return {
+        "ok": True,
+        "latency_ms": latency_ms,
+        "data": data,
+    }
 
-    url = f"{WORKER_BASE_URL}/agent/stop"
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
-            r = await client.post(url, json=payload)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail={"worker_error": r.text})
-        return {"ok": True, "worker": r.json() if r.headers.get("content-type","").startswith("application/json") else r.text}
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Worker request failed: {str(e)}")
 
-# If you *really* need raw request.json(), it must be inside a function like this:
-@app.post("/debug/echo")
-async def echo(request: Request):
-    payload = await request.json()
-    return {"ok": True, "payload": payload}
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+
+@app.post("/tool/call")
+async def tool_call(request: Request):
+    """
+    Expected body:
+    {
+      "toolset": "demo",
+      "tool": "calendar_slots" | "calendar_set_appointment",
+      "payload": { ... }
+    }
+    """
+    body = await request.json()
+    toolset = body.get("toolset") or "demo"
+    tool = body.get("tool")
+    payload = body.get("payload") or {}
+
+    if not tool:
+        raise HTTPException(status_code=400, detail="Missing 'tool'")
+
+    tool_map = _load_tool_map()
+
+    if toolset not in tool_map:
+        raise HTTPException(status_code=400, detail=f"Unknown toolset: {toolset}")
+
+    if tool not in tool_map[toolset]:
+        raise HTTPException(status_code=400, detail=f"Unknown tool '{tool}' in toolset '{toolset}'")
+
+    path_or_url = tool_map[toolset][tool]
+
+    # Forward to n8n with auth header
+    result = await call_n8n(path_or_url, payload)
+    return JSONResponse(result)
